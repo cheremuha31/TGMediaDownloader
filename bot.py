@@ -205,7 +205,7 @@ async def main() -> None:
 
     @dp.message(CommandStart())
     async def on_start(message: Message) -> None:
-        await message.answer("Отправьте ссылку сюда или используйте inline: @username <ссылка>")
+        await message.answer("Привет! Отправь мне ссылку на видео и я его скачаю")
 
     @dp.callback_query(F.data == "noop")
     async def on_noop(callback: CallbackQuery) -> None:
