@@ -1,0 +1,9 @@
+﻿venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary media files
+tmp/
