@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -43,6 +44,9 @@ class UserSettings:
     send_as_file: bool = False
 
 
+USER_SETTINGS_FILE = Path(__file__).with_name("user_settings.json")
+
+
 def load_settings():
     load_dotenv()
     token = (os.getenv("BOT_TOKEN") or "").strip()
@@ -58,6 +62,64 @@ def load_settings():
     except ValueError as e:
         raise ValueError("CACHE_CHAT_ID must be an integer (example: -1001234567890)") from e
     return token, cache_chat_id, max_size_bytes, cookies_file
+
+
+def load_user_settings(path: Path, logger: logging.Logger) -> dict[int, UserSettings]:
+    if not path.is_file():
+        return {}
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        logger.exception("failed to read user settings from %s", path)
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning("user settings file has invalid format: %s", path)
+        return {}
+
+    result: dict[int, UserSettings] = {}
+    for user_id_raw, settings_raw in raw.items():
+        try:
+            user_id = int(user_id_raw)
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(settings_raw, dict):
+            continue
+
+        video_quality = str(settings_raw.get("video_quality", "best"))
+        if video_quality not in {"best", "720", "480"}:
+            video_quality = "best"
+
+        result[user_id] = UserSettings(
+            video_quality=video_quality,
+            add_link=bool(settings_raw.get("add_link", True)),
+            send_as_file=bool(settings_raw.get("send_as_file", False)),
+        )
+
+    return result
+
+
+def save_user_settings(path: Path, user_settings: dict[int, UserSettings], logger: logging.Logger) -> None:
+    payload = {
+        str(user_id): {
+            "video_quality": settings.video_quality,
+            "add_link": settings.add_link,
+            "send_as_file": settings.send_as_file,
+        }
+        for user_id, settings in user_settings.items()
+    }
+
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except OSError:
+        logger.exception("failed to write user settings to %s", path)
 
 
 def extract_url(text: str) -> str | None:
@@ -321,7 +383,7 @@ async def main() -> None:
     token, cache_chat_id, max_size_bytes, cookies_file = load_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger = logging.getLogger("tgmedia")
-    per_user_settings: dict[int, UserSettings] = {}
+    per_user_settings = load_user_settings(USER_SETTINGS_FILE, logger)
 
     bot = Bot(token)
     dp = Dispatcher()
@@ -389,6 +451,8 @@ async def main() -> None:
                 build_settings_text(settings),
                 reply_markup=build_settings_keyboard(settings),
             )
+        if changed:
+            save_user_settings(USER_SETTINGS_FILE, per_user_settings, logger)
         await callback.answer("Настройки сохранены" if changed else "Уже выбрано")
 
     @dp.inline_query()

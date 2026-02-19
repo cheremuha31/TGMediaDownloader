@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+user_settings.json
 
 # Temporary media files
 tmp/
