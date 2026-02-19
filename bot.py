@@ -288,7 +288,7 @@ async def handle_chosen(
             )
             file_path = await asyncio.to_thread(download_sync, url, options)
             media_kind = tg_media_kind(file_path)
-            caption = f"Source: {url}"[:1024] if user_settings.add_link and media_kind == "video" else None
+            caption = url[:1024] if user_settings.add_link and media_kind == "video" else None
 
             if media_kind == "image":
                 sent = await bot.send_photo(cache_chat_id, FSInputFile(file_path))
@@ -350,7 +350,7 @@ async def handle_text_link(
             )
             file_path = await asyncio.to_thread(download_sync, url, options)
             media_kind = tg_media_kind(file_path)
-            caption = f"Source: {url}"[:1024] if user_settings.add_link and media_kind == "video" else None
+            caption = url[:1024] if user_settings.add_link and media_kind == "video" else None
 
             if media_kind == "image":
                 media = InputMediaPhoto(media=FSInputFile(file_path), caption=caption)
