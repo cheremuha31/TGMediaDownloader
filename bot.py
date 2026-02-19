@@ -31,6 +31,8 @@ from yt_dlp.utils import DownloadError
 
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 SUPPORTED_DOMAINS = ("instagram.com", "instagr.am", "tiktok.com", "youtube.com", "youtu.be")
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".gif"}
 
 
 def load_settings():
@@ -54,6 +56,56 @@ def extract_url(text: str) -> str | None:
     return url
 
 
+def is_supported_source(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in SUPPORTED_DOMAINS)
+
+
+def build_download_options(tmp_path: Path, max_size_bytes: int, cookies_file: str | None) -> dict:
+    options = {
+        "outtmpl": str(tmp_path / "media.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": max_size_bytes,
+    }
+    if shutil.which("ffmpeg"):
+        options["merge_output_format"] = "mp4"
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+    return options
+
+
+def download_sync(url: str, options: dict) -> Path:
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if isinstance(info, dict) and info.get("entries"):
+            info = next((x for x in info["entries"] if isinstance(x, dict)), {})
+        if not isinstance(info, dict):
+            info = {}
+
+        path = None
+        req = info.get("requested_downloads")
+        if isinstance(req, list) and req and isinstance(req[0], dict):
+            path = req[0].get("filepath")
+        if not path:
+            path = ydl.prepare_filename(info)
+
+        file_path = Path(path)
+        if not file_path.is_file():
+            raise RuntimeError("Downloaded file not found")
+        return file_path
+
+
+def tg_media_kind(file_path: Path) -> str:
+    ext = file_path.suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in VIDEO_EXTENSIONS:
+        return "video"
+    return "document"
+
+
 async def handle_chosen(
     bot: Bot,
     logger: logging.Logger,
@@ -68,46 +120,14 @@ async def handle_chosen(
 
         with tempfile.TemporaryDirectory(prefix="tgmedia_") as tmp_dir:
             tmp_path = Path(tmp_dir)
+            options = build_download_options(tmp_path, max_size_bytes, cookies_file)
+            file_path = await asyncio.to_thread(download_sync, url, options)
+            media_kind = tg_media_kind(file_path)
 
-            options = {
-                "outtmpl": str(tmp_path / "media.%(ext)s"),
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "max_filesize": max_size_bytes,
-            }
-            if shutil.which("ffmpeg"):
-                options["merge_output_format"] = "mp4"
-            if cookies_file:
-                options["cookiefile"] = cookies_file
-
-            def download_sync():
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if isinstance(info, dict) and info.get("entries"):
-                        info = next((x for x in info["entries"] if isinstance(x, dict)), {})
-                    if not isinstance(info, dict):
-                        info = {}
-
-                    path = None
-                    req = info.get("requested_downloads")
-                    if isinstance(req, list) and req and isinstance(req[0], dict):
-                        path = req[0].get("filepath")
-                    if not path:
-                        path = ydl.prepare_filename(info)
-
-                    file_path = Path(path)
-                    if not file_path.is_file():
-                        raise RuntimeError("Downloaded file not found")
-                    return file_path
-
-            file_path = await asyncio.to_thread(download_sync)
-            ext = file_path.suffix.lower()
-
-            if ext in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
+            if media_kind == "image":
                 sent = await bot.send_photo(cache_chat_id, FSInputFile(file_path))
                 media = InputMediaPhoto(media=sent.photo[-1].file_id, caption=f"Source: {url}"[:1024])
-            elif ext in {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".gif"}:
+            elif media_kind == "video":
                 sent = await bot.send_video(
                     cache_chat_id,
                     FSInputFile(file_path),
@@ -134,6 +154,47 @@ async def handle_chosen(
         await bot.edit_message_text(inline_message_id=inline_message_id, text="Файл не найден после загрузки.")
 
 
+async def handle_text_link(
+    bot: Bot,
+    logger: logging.Logger,
+    message: Message,
+    url: str,
+    max_size_bytes: int,
+    cookies_file: str | None,
+) -> None:
+    status = await message.answer("Скачиваю...")
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="tgmedia_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            options = build_download_options(tmp_path, max_size_bytes, cookies_file)
+            file_path = await asyncio.to_thread(download_sync, url, options)
+            media_kind = tg_media_kind(file_path)
+            caption = f"Source: {url}"[:1024]
+
+            if media_kind == "image":
+                media = InputMediaPhoto(media=FSInputFile(file_path), caption=caption)
+            elif media_kind == "video":
+                media = InputMediaVideo(media=FSInputFile(file_path), caption=caption, supports_streaming=True)
+            else:
+                media = InputMediaDocument(media=FSInputFile(file_path), caption=caption)
+
+            await bot.edit_message_media(
+                chat_id=status.chat.id,
+                message_id=status.message_id,
+                media=media,
+            )
+    except DownloadError:
+        logger.exception("download failed direct url=%s", url)
+        await status.edit_text("Не удалось скачать видео.")
+    except TelegramBadRequest:
+        logger.exception("telegram bad request direct url=%s", url)
+        await status.edit_text("Ошибка Telegram, попробуйте еще раз.")
+    except RuntimeError:
+        logger.exception("runtime error direct url=%s", url)
+        await status.edit_text("Файл не найден после загрузки.")
+
+
 async def main() -> None:
     token, cache_chat_id, max_size_bytes, cookies_file = load_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -144,7 +205,7 @@ async def main() -> None:
 
     @dp.message(CommandStart())
     async def on_start(message: Message) -> None:
-        await message.answer("Используйте inline: @username <ссылка>")
+        await message.answer("Отправьте ссылку сюда или используйте inline: @username <ссылка>")
 
     @dp.callback_query(F.data == "noop")
     async def on_noop(callback: CallbackQuery) -> None:
@@ -171,8 +232,7 @@ async def main() -> None:
             )
             return
 
-        host = (urlparse(url).hostname or "").lower()
-        if not any(host == d or host.endswith(f".{d}") for d in SUPPORTED_DOMAINS):
+        if not is_supported_source(url):
             await inline_query.answer(
                 results=[
                     InlineQueryResultArticle(
@@ -223,6 +283,33 @@ async def main() -> None:
                 max_size_bytes=max_size_bytes,
                 cookies_file=cookies_file,
             )
+        )
+
+    @dp.message(F.text)
+    async def on_text_message(message: Message) -> None:
+        if message.chat.type != "private":
+            return
+
+        text = message.text or ""
+        if text.startswith("/"):
+            return
+
+        url = extract_url(text)
+        if not url:
+            await message.answer("Отправьте ссылку из Instagram, TikTok или YouTube.")
+            return
+
+        if not is_supported_source(url):
+            await message.answer("Поддерживаются только Instagram, TikTok и YouTube.")
+            return
+
+        await handle_text_link(
+            bot=bot,
+            logger=logger,
+            message=message,
+            url=url,
+            max_size_bytes=max_size_bytes,
+            cookies_file=cookies_file,
         )
 
     await dp.start_polling(bot)
